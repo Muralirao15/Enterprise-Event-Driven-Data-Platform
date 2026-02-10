@@ -1,0 +1,7 @@
+black
+pylint
+boto3
+pandas
+pyarrow
+pyspark
+python-dotenv
