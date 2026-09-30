@@ -1,131 +1,226 @@
+import logging
 import os
 import sys
-from typing import Dict, Any
+from pathlib import Path
+from typing import Any
+
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 
-def load_environment_variables() -> Dict[str, Any]:
-    """Load and validate required environment variables."""
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def load_environment_variables() -> dict[str, str]:
+    """Load and validate required application configuration."""
+
     load_dotenv()
 
-    required_vars = [
-        "Access_key_ID",
-        "Secret_access_key",
-        "BUCKET_NAME",
-        "ORDER_DATA_PATH",
-        "ORDER_ITEMS_DATA_PATH",
-        "PRODUCT_DATA_PATH",
-        "REGION_NAME",
+    required_vars = {
+        "BUCKET_NAME": os.getenv("BUCKET_NAME"),
+        "ORDER_DATA_PATH": os.getenv("ORDER_DATA_PATH"),
+        "ORDER_ITEMS_DATA_PATH": os.getenv("ORDER_ITEMS_DATA_PATH"),
+        "PRODUCT_DATA_PATH": os.getenv("PRODUCT_DATA_PATH"),
+        "AWS_REGION": os.getenv("AWS_REGION"),
+    }
+
+    missing_vars = [
+        name for name, value in required_vars.items()
+        if not value
     ]
 
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
     if missing_vars:
         raise EnvironmentError(
-            f"Missing required environment variables: {', '.join(missing_vars)}"
+            "Missing required environment variables: "
+            + ", ".join(missing_vars)
         )
 
     return {
-        "access_key_id": os.getenv("Access_key_ID"),
-        "secret_access_key": os.getenv("Secret_access_key"),
-        "bucket_name": os.getenv("BUCKET_NAME"),
-        "order_data_path": os.getenv("ORDER_DATA_PATH"),
-        "order_items_data_path": os.getenv("ORDER_ITEMS_DATA_PATH"),
-        "product_data_path": os.getenv("PRODUCT_DATA_PATH"),
-        "region_name": os.getenv("REGION_NAME"),
+        name.lower(): value
+        for name, value in required_vars.items()
+        if value is not None
     }
 
 
-def initialize_s3_client(access_key: str, secret_key: str, region: str) -> boto3.client:
-    """Initialize and return an S3 client."""
+# ---------------------------------------------------------------------------
+# AWS S3
+# ---------------------------------------------------------------------------
+
+def initialize_s3_client(region: str) -> Any:
+    """Create and return an AWS S3 client.
+
+    AWS credentials are resolved automatically by boto3 using
+    its standard credential provider chain.
+    """
+
     try:
         return boto3.client(
             "s3",
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
             region_name=region,
         )
-    except (BotoCoreError, ClientError) as e:
-        raise RuntimeError(f"Failed to initialize S3 client: {str(e)}") from e
+
+    except (BotoCoreError, ClientError) as exc:
+        raise RuntimeError(
+            "Failed to initialize the S3 client."
+        ) from exc
 
 
-def upload_files_to_s3(
-    s3_client: boto3.client, bucket_name: str, local_path: str, s3_prefix: str
+# ---------------------------------------------------------------------------
+# File Upload
+# ---------------------------------------------------------------------------
+
+def upload_file_to_s3(
+    s3_client: Any,
+    bucket_name: str,
+    local_path: str,
+    s3_key: str,
 ) -> None:
-    """Upload all files from local_path to s3_prefix in the bucket."""
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(f"Local path does not exist: {local_path}")
+    """Upload a single file to an S3 bucket."""
 
-    files = os.listdir(local_path)
+    file_path = Path(local_path)
+
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"File does not exist: {file_path}"
+        )
+
+    try:
+        logger.info(
+            "Uploading %s -> s3://%s/%s",
+            file_path,
+            bucket_name,
+            s3_key,
+        )
+
+        s3_client.upload_file(
+            str(file_path),
+            bucket_name,
+            s3_key,
+        )
+
+        logger.info(
+            "Successfully uploaded %s",
+            file_path,
+        )
+
+    except (BotoCoreError, ClientError, OSError) as exc:
+        raise RuntimeError(
+            f"Failed to upload {file_path}"
+        ) from exc
+
+
+def upload_directory_to_s3(
+    s3_client: Any,
+    bucket_name: str,
+    local_path: str,
+    s3_prefix: str,
+) -> None:
+    """Upload all files from a directory to an S3 prefix."""
+
+    directory = Path(local_path)
+
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Directory does not exist: {directory}"
+        )
+
+    files = [
+        file_path
+        for file_path in directory.iterdir()
+        if file_path.is_file()
+    ]
+
     if not files:
-        print(f"No files found in {local_path}")
+        logger.warning(
+            "No files found in %s",
+            directory,
+        )
         return
 
-    for file in files:
-        file_path = os.path.join(local_path, file)
-        s3_key = f"{s3_prefix}/{file}"
+    for file_path in files:
+        s3_key = f"{s3_prefix}/{file_path.name}"
 
-        try:
-            s3_client.upload_file(file_path, bucket_name, s3_key)
-            print(f"Successfully uploaded {file_path} to s3://{bucket_name}/{s3_key}")
-        except (BotoCoreError, ClientError, IOError) as e:
-            print(f"Error uploading {file_path}: {str(e)}", file=sys.stderr)
+        upload_file_to_s3(
+            s3_client,
+            bucket_name,
+            str(file_path),
+            s3_key,
+        )
 
 
-def upload_single_file_to_s3(
-    s3_client: boto3.client, bucket_name: str, local_path: str, s3_key: str
-) -> None:
-    """Upload a single file to S3."""
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(f"File does not exist: {local_path}")
-
-    try:
-        s3_client.upload_file(local_path, bucket_name, s3_key)
-        print(f"Successfully uploaded {local_path} to s3://{bucket_name}/{s3_key}")
-    except (BotoCoreError, ClientError, IOError) as e:
-        raise RuntimeError(f"Error uploading {local_path}: {str(e)}") from e
-
+# ---------------------------------------------------------------------------
+# Main Application
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Main function to orchestrate the S3 upload process."""
+    """Run the S3 data upload pipeline."""
+
     try:
-        # Load configuration
         config = load_environment_variables()
 
-        # Initialize S3 client
         s3_client = initialize_s3_client(
-            config["access_key_id"], config["secret_access_key"], config["region_name"]
+            config["aws_region"]
         )
 
-        # Upload orders data
-        upload_files_to_s3(
-            s3_client, config["bucket_name"], config["order_data_path"], "orders"
-        )
+        bucket_name = config["bucket_name"]
 
-        # Upload order items data
-        upload_files_to_s3(
+        # Upload orders
+        upload_directory_to_s3(
             s3_client,
-            config["bucket_name"],
+            bucket_name,
+            config["order_data_path"],
+            "orders",
+        )
+
+        # Upload order items
+        upload_directory_to_s3(
+            s3_client,
+            bucket_name,
             config["order_items_data_path"],
             "order_items",
         )
 
-        # Upload product data (single file)
-        upload_single_file_to_s3(
+        # Upload products
+        product_path = Path(config["product_data_path"])
+
+        upload_file_to_s3(
             s3_client,
-            config["bucket_name"],
-            config["product_data_path"],
-            os.path.basename(config["product_data_path"]),
+            bucket_name,
+            str(product_path),
+            f"products/{product_path.name}",
         )
 
-        print("All upload operations completed.")
+        logger.info(
+            "All S3 upload operations completed successfully."
+        )
 
-    except (EnvironmentError, RuntimeError, FileNotFoundError) as e:
-        print(f"Fatal error: {str(e)}", file=sys.stderr)
+    except (
+        EnvironmentError,
+        RuntimeError,
+        FileNotFoundError,
+    ) as exc:
+
+        logger.error("Upload process failed: %s", exc)
         sys.exit(1)
-    except Exception as e:  # pylint: disable=W0703
-        print(f"Unexpected error: {str(e)}", file=sys.stderr)
+
+    except Exception:
+        logger.exception(
+            "Unexpected error occurred during S3 upload."
+        )
         sys.exit(1)
 
 
